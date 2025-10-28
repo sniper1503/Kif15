@@ -1,0 +1,246 @@
+---
+title: "Исследование метаданных DNS трафика"
+subtitle: "Отчёт по практике 4"
+author: "sniper12.04@yandex.ru"
+format:
+  md:
+    output-file: README.md
+---
+
+## Цель работы
+
+1.  Развить практические навыки использования языка программирования R для обработки данных
+2.  Закрепить знания базовых типов данных языка R
+3.  Развить практические навыки использования функций обработки данных пакета dplyr – функции select(), filter(), mutate(), arrange(), group_by()
+
+## Исходные данные
+
+1.  Программное обеспечение ОС Windows 10 Pro
+2.  RStudio
+3.  Интерпретатор языка R 4.5.1
+
+## План
+
+1\. Загрузка и распаковка архива [dns.zip](https://dns.zip/ "https://dns.zip/")\
+2. Импорт данных в R (например, с помощью readdelim() или readcsv())\
+3. Назначение названий столбцов и описание структуры данных\
+4. Преобразование типов данных (даты, IP, домены и пр.)\
+5. Просмотр структуры с glimpse()\
+6. Подсчёт количества уникальных участников информационного обмена\
+7. Определение соотношения внутренних и внешних участников\
+8. Выявление топ-10 самых активных участников сети\
+9. Выявление топ-10 доменов по количеству обращений\
+10. Расчёт интервалов между запросами к топ-10 доменам и их статистика (summary())\
+11. Поиск IP-адресов с признаками скрытого DNS-канала (периодичность запросов)\
+12. Получение геолокации и информации о провайдере для топ-10 доменов через API [ip-api.com](https://ip-api.com/ "https://ip-api.com/").
+
+## **Шаги:**
+
+```{r}
+options(repos = c(CRAN = "https://mirror.truenetwork.ru/CRAN/"))
+install.packages("readr")
+```
+
+```{r}
+install.packages("dplyr")
+```
+
+```{r}
+install.packages("stringr")
+```
+
+```{r}
+install.packages("httr")
+```
+
+```{r}
+install.packages("jsonlite")
+```
+
+```{r}
+install.packages("tidyverse")
+library(tidyverse)
+```
+
+\## Загрузка и распаковка архива [dns.zip](https://dns.zip/ "https://dns.zip/")
+
+```{r}
+download.file("https://storage.yandexcloud.net/dataset.ctfsec/dns.zip", "dns.zip")
+unzip("dns.zip", exdir = "dns_data")
+```
+
+\## Импорт данных в R (например, с помощью readdelim() или readcsv())
+
+```{r}
+dns_raw <- read_delim("dns_data/dns.log", delim = "\t", comment = "#", col_names = FALSE)
+```
+
+\## Назначение названий столбцов и описание структуры данных
+
+```{r}
+column_names <- c(
+  "timestamp", "uid", "source_ip", "source_port", "destination_ip", 
+  "destination_port", "protocol", "transaction_id", "query", "qclass", 
+  "qclass_name", "qtype", "qtype_name", "rcode", "rcode_name", 
+  "AA", "TC", "RD", "RA", "Z", "answers", "TTLS", "rejected"
+)
+
+dns_data <- read_delim(
+  "dns_data/dns.log",  # ← здесь путь к файлу напрямую
+  delim = "\t",
+  col_names = column_names,
+  comment = "#",
+  na = c("", "NA", "-"),
+  trim_ws = TRUE,
+  show_col_types = FALSE
+) %>% as_tibble()
+
+head(dns_data, 10)
+```
+
+```         
+```
+
+\## Преобразование типов данных (даты, IP, домены и пр.)
+
+```{r}
+library(dplyr)
+
+dns_data <- dns_data %>%
+  mutate(
+    timestamp = as.POSIXct(timestamp, origin = "1970-01-01"),
+    source_ip = as.character(source_ip),
+    destination_ip = as.character(destination_ip),
+    source_port = as.integer(source_port),
+    destination_port = as.integer(destination_port),
+    transaction_id = as.integer(transaction_id),
+    query = tolower(as.character(query)),
+    qclass = as.integer(qclass),
+    qtype = as.integer(qtype),
+    rcode = as.integer(rcode),
+    AA = as.logical(AA),
+    TC = as.logical(TC),
+    RD = as.logical(RD),
+    RA = as.logical(RA),
+    Z = as.integer(Z),
+    rejected = as.logical(rejected)
+  )
+
+glimpse(dns_data)
+```
+
+\## Подсчёт количества уникальных участников информационного обмена
+
+```{r}
+participants <- dns_data %>%
+  select(source_ip, destination_ip) %>%
+  pivot_longer(cols = everything(), values_to = "ip") %>%
+  distinct(ip)
+
+n_participants <- nrow(participants)
+print(n_participants)
+```
+
+\## Определение соотношения внутренних и внешних участников
+
+```{r}
+participants <- participants %>%
+  mutate(type = if_else(str_detect(ip, "^192\\.168\\."), "internal", "external"))
+
+table(participants$type)
+```
+
+\## Выявление топ-10 самых активных участников сети
+
+```{r}
+top_active <- dns_data %>%
+  count(source_ip, sort = TRUE) %>%
+  slice_head(n = 10)
+
+print(top_active)
+```
+
+\## Выявление топ-10 доменов по количеству обращений
+
+```{r}
+top_domains <- dns_data %>%
+  filter(!is.na(query)) %>%
+  count(query, sort = TRUE) %>%
+  slice_head(n = 10)
+
+print(top_domains)
+```
+
+\## Расчёт интервалов между запросами к топ-10 доменам и их статистика (summary())
+
+```{r}
+dns_data <- dns_data %>% arrange(query, timestamp)
+
+interval_stats <- top_domains$query %>%
+  map_df(function(domain) {
+    times <- dns_data %>%
+      filter(query == domain) %>%
+      arrange(timestamp) %>%
+      pull(timestamp)
+    
+    intervals <- diff(times)
+    
+    tibble(
+      domain = domain,
+      summary = list(summary(as.numeric(intervals)))
+    )
+  })
+
+print(interval_stats)
+```
+
+\## Поиск IP-адресов с признаками скрытого DNS-канала (периодичность запросов)
+
+```{r}
+suspicious_ips <- dns_data %>%
+  group_by(source_ip, query) %>%
+  filter(n() > 10) %>%
+  arrange(timestamp) %>%
+  mutate(interval = as.numeric(difftime(timestamp, lag(timestamp), units = "secs"))) %>%
+  summarise(sd_interval = sd(interval, na.rm = TRUE), .groups = "drop") %>%
+  filter(sd_interval < 1)  # почти одинаковые интервалы
+
+print(suspicious_ips)
+```
+
+\## Получение геолокации и информации о провайдере для топ-10 доменов через API [ip-api.com](https://ip-api.com/ "https://ip-api.com/").
+
+```{r}
+library(httr)
+library(jsonlite)
+
+lookup_ip <- function(domain) {
+  res <- GET(paste0("http://ip-api.com/json/", domain))
+  fromJSON(content(res, "text", encoding = "UTF-8"))
+}
+
+geo_info <- top_domains$query %>%
+  map_df(function(domain) {
+    info <- tryCatch(lookup_ip(domain), error = function(e) NULL)
+    if (!is.null(info) && info$status == "success") {
+      tibble(
+        domain = domain,
+        country = info$country,
+        city = info$city,
+        isp = info$isp
+      )
+    } else {
+      tibble(domain = domain, country = NA, city = NA, isp = NA)
+    }
+  })
+
+print(geo_info)
+```
+
+## **Оценка результата**
+
+В данной практической работе мы применили ранее полученные знания для анализа сетевого трафика на основе DNS-логов. Были выполнены операции по импорту, структурированию, преобразованию и исследованию данных с использованием пакета dplyr.
+
+## **Вывод**
+
+Таким образом, мы закрепили навыки работы с функциями dplyr: select(), filter(), mutate(), arrange(), group_by(), summarise(), count() и join(), применяя их к реальным данным сетевой активности для выявления участников, популярных доменов и потенциальных угроз.
